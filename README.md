@@ -1,5 +1,7 @@
 ## Quiche
 
+> This project is based on a fork of [quiche](https://github.com/cloudflare/quiche), maintained by Cloudflare.  
+> It has been modified for experimental and research purposes related to HTTP/3 and prioritization behavior.
 Assuming Docker Desktop is running, the Quiche server can be started using:
 ```bat
 python setup_server.py
