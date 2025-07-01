@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>HTTP/3 live reprioritisation demo</title>
+  <style>
+    body   { font-family: system-ui; margin: 2rem; }
+    h1     { margin-bottom: 1rem; }
+    .row   {
+      display: flex; flex-direction: column; gap: .4rem;
+      padding: .8rem .6rem; border: 1px solid #ccc; border-radius: 6px;
+      margin-bottom: 1rem; background: #f9f9f9;
+    }
+    .controls {
+      display: flex; align-items: center; gap: .6rem;
+    }
+    .meta {
+      font-size: 0.85rem; color: #444; display: flex; gap: 1.5rem;
+    }
+    label      { font-weight: bold; width: 90px; }
+    progress   { flex: 1 1 240px; height: 1rem; }
+    select,button { padding: .25rem .5rem; }
+  </style>
+</head>
+<body>
+<h1>Priority-update playground</h1>
+<p>Each file starts at its <kbd>initU</kbd> urgency.  
+   While it’s still downloading choose a new urgency and hit <strong>Apply</strong>.</p>
+
+<div id="list"></div>
+
+<script>
+const assets = [
+  { file: 'store.glb',           label: 'Store'   , initU: 2 },
+  { file: 'MosquitoInAmber.glb', label: 'Mosquito', initU: 3 },
+  { file: 'sponza.glb',          label: 'Sponza'  , initU: 4 },
+];
+
+const list = document.getElementById('list');
+const activeDownloads = new Map();
+
+for (const asset of assets) {
+  const row = document.createElement('div');
+  row.className = 'row';
+  row.innerHTML = `
+    <div class="controls">
+      <label>${asset.label}</label>
+      <progress max="100" value="0"></progress>
+      <select>
+        ${[0,1,2,3,4,5,6,7].map(u => `<option value="${u}" ${u === asset.initU ? 'selected' : ''}>${u}</option>`).join('')}
+      </select>
+      <button>Apply</button>
+    </div>
+    <div class="meta">
+      <div><strong>Stream ID:</strong> <span class="stream-id">-</span></div>
+      <div><strong>Urgency:</strong> <span class="urgency">${asset.initU}</span></div>
+      <div><strong>Arrival:</strong> <span class="arrival">-</span></div>
+    </div>
+  `;
+  list.appendChild(row);
+
+  const [prog, select, button] = row.querySelectorAll('progress, select, button');
+  const streamIdSpan = row.querySelector('.stream-id');
+  const urgencySpan  = row.querySelector('.urgency');
+  const arrivalSpan  = row.querySelector('.arrival');
+
+  // Start fetch with initial priority
+  const url = `${asset.file}?u=${asset.initU}&i=1`;
+  fetch(url).then(resp => {
+  const streamId = resp.headers.get('h3_stream_id');
+  if (!streamId) {
+    console.warn(`Missing stream ID for ${asset.file}`);
+    return;
+  }
+
+  streamIdSpan.textContent = streamId;
+  const reader = resp.body.getReader(); // ✅ only call once
+
+  activeDownloads.set(asset.file, { streamId, reader });
+
+  // Optional auto-prioritisation
+  if (asset.file === 'sponza.glb') {
+    fetch(`/_updatePriority?stream=${streamId}&u=7&i=1`)
+      .then(r => {
+        if (!r.ok) console.warn('Auto-reprioritization failed for Sponza');
+        else urgencySpan.textContent = '7';
+      });
+  }
+
+  let received = 0;
+  const contentLength = +resp.headers.get('content-length') || 50_000_000;
+
+  function pump() {
+    reader.read().then(({ done, value }) => {
+      if (done) {
+        prog.value = 100;
+        arrivalSpan.textContent = new Date().toLocaleTimeString();
+        return;
+      }
+      received += value.length;
+      prog.value = Math.min((received / contentLength) * 100, 100);
+      pump();
+    });
+  }
+  pump();
+});
+
+
+  // Reprioritize handler
+  button.onclick = () => {
+    const newU = select.value;
+    const entry = activeDownloads.get(asset.file);
+    if (!entry || !entry.streamId) return;
+    const controlURL = `/_updatePriority?stream=${entry.streamId}&u=${newU}&i=1`;
+    fetch(controlURL).then(r => {
+      if (!r.ok) {
+        console.warn(`Failed reprioritization for ${asset.file}`);
+      } else {
+        urgencySpan.textContent = newU;
+      }
+    });
+  };
+}
+</script>
+</body>
+</html>

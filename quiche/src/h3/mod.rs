@@ -816,6 +816,7 @@ pub enum Event {
 pub struct Priority {
     urgency: u8,
     incremental: bool,
+	
 }
 
 impl Default for Priority {
@@ -834,6 +835,14 @@ impl Priority {
             urgency,
             incremental,
         }
+    }
+	
+	 pub fn urgency(&self) -> u8 {
+        self.urgency
+    }
+
+    pub fn incremental(&self) -> bool {
+        self.incremental
     }
 }
 

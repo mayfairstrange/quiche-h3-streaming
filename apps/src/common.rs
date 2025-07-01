@@ -51,11 +51,15 @@ use quiche::ConnectionId;
 use quiche::h3::NameValue;
 use quiche::h3::Priority;
 
+
+
 pub fn stdout_sink(out: String) {
     print!("{out}");
 }
 
 const H3_MESSAGE_ERROR: u64 = 0x10E;
+const BURST: usize = 16 * 1024; 
+
 
 /// ALPN helpers.
 ///
@@ -673,7 +677,7 @@ impl HttpConn for Http09Conn {
         Ok(())
     }
 
-    fn handle_writable(
+ fn handle_writable(
         &mut self, conn: &mut quiche::Connection,
         partial_responses: &mut HashMap<u64, PartialResponse>, stream_id: u64,
     ) {
@@ -1152,15 +1156,6 @@ impl HttpConn for Http3Conn {
                 },
             };
 
-            debug!("Sent HTTP request {:?}", &req.hdrs);
-
-            if let Some(priority) = &req.priority {
-                // If sending the priority fails, don't try again.
-                self.h3_conn
-                    .send_priority_update_for_request(conn, s, priority)
-                    .ok();
-            }
-
             req.stream_id = Some(s);
             req.response_writer =
                 make_resource_writer(&req.url, target_path, req.cardinal);
@@ -1403,53 +1398,87 @@ impl HttpConn for Http3Conn {
         // This loops over any and all received HTTP requests and sends just the
         // HTTP response headers.
         loop {
-            match self.h3_conn.poll(conn) {
-                Ok((stream_id, quiche::h3::Event::Headers { list, .. })) => {
-                    info!(
-                        "{} got request {:?} on stream id {}",
-                        conn.trace_id(),
-                        hdrs_to_strings(&list),
-                        stream_id
-                    );
+			match self.h3_conn.poll(conn) {
+				Ok((stream_id, quiche::h3::Event::Headers { list, .. })) => {
+					// The control‐stream is just the same stream_id here
+					let ctrl_id = stream_id;
 
-                    self.largest_processed_request =
-                        std::cmp::max(self.largest_processed_request, stream_id);
+					// Check for an _updatePriority request
+					// --- handle /_updatePriority ---------------------------------------------
+					if let Some(path_header) = list.iter().find(|h| h.name() == b":path") {
+						let path_val = std::str::from_utf8(path_header.value()).unwrap_or("");
 
-                    // We decide the response based on headers alone, so
-                    // stop reading the request stream so that any body
-                    // is ignored and pointless Data events are not
-                    // generated.
-                    conn.stream_shutdown(stream_id, quiche::Shutdown::Read, 0)
-                        .unwrap();
+						if path_val.starts_with("/_updatePriority") {
+							// Parse helper URL (fake host so url::Url accepts it).
+							let url = url::Url::parse(&format!("https://dummy{}", path_val))
+								.expect("bad _updatePriority URL");
 
-                    let (mut headers, body, mut priority) =
-                        match Http3Conn::build_h3_response(root, index, &list) {
-                            Ok(v) => v,
+							// Target stream.
+							let target_id = url.query_pairs()
+								.find(|(k, _)| k == "stream")
+								.and_then(|(_, v)| v.parse::<u64>().ok())
+								.expect("missing ?stream=");
 
-                            Err((error_code, _)) => {
-                                conn.stream_shutdown(
-                                    stream_id,
-                                    quiche::Shutdown::Write,
-                                    error_code,
-                                )
-                                .unwrap();
-                                continue;
-                            },
-                        };
+							// Build the new Priority (already a quiche::h3::Priority).
+							if let Some(new_prio) = priority_from_query_string(&url) {
+	
+						
+								conn.stream_priority(
+									target_id,
+									new_prio.urgency(),
+									new_prio.incremental(),
+								).ok();
 
-                    match self.h3_conn.take_last_priority_update(stream_id) {
-                        Ok(v) => {
-                            priority = v;
-                        },
+								// 3.  Keep it in our book-keeping so send-queue sorting sees it.
+								if let Some(entry) = partial_responses.get_mut(&target_id) {
+									entry.priority = Some(new_prio.clone());
+								}
 
-                        Err(quiche::h3::Error::Done) => (),
+								info!(
+									"{} reprioritised stream {} → {:?}",
+									conn.trace_id(),
+									target_id,
+									new_prio
+								);
+							}
 
-                        Err(e) => error!(
-                            "{} error taking PRIORITY_UPDATE {}",
-                            conn.trace_id(),
-                            e
-                        ),
-                    }
+							// 4.  ACK on the control stream so the browser marks the request done.
+							let ack_headers = vec![
+								quiche::h3::Header::new(b":status",        b"200"),
+								quiche::h3::Header::new(b"content-length", b"2"),
+								quiche::h3::Header::new(b"content-type",   b"text/plain"),
+							];
+							self.h3_conn.send_response(conn, stream_id, &ack_headers, false)?;
+							self.h3_conn.send_body   (conn, stream_id, b"OK",       true)?;
+
+							break;   // don’t fall through to normal request handling
+						}
+					}
+					// --------------------------------------------------------------------------
+
+
+					// … normal request handling for this stream_id …
+					info!(
+						"{} got request {:?} on stream id {}",
+						conn.trace_id(),
+						hdrs_to_strings(&list),
+						stream_id
+					);
+
+					self.largest_processed_request =
+						std::cmp::max(self.largest_processed_request, stream_id);
+
+					conn.stream_shutdown(stream_id, quiche::Shutdown::Read, 0).unwrap();
+
+					let (mut headers, body, mut priority) =
+						match Http3Conn::build_h3_response(root, index, &list) {
+							Ok(v) => v,
+							Err((error_code, _)) => {
+								conn.stream_shutdown(stream_id, quiche::Shutdown::Write, error_code)
+									.unwrap();
+								continue;
+							}
+						};
 
                     if !priority.is_empty() {
                         headers.push(quiche::h3::Header::new(
@@ -1473,6 +1502,16 @@ impl HttpConn for Http3Conn {
                         priority
                     );
 
+
+					headers.push(quiche::h3::Header::new(b"h3_stream_id", stream_id.to_string().as_bytes()));
+					
+					#[cfg(feature = "sfv")]
+					{
+						let urgency = priority.urgency();
+						let incremental = priority.incremental();
+
+						conn.stream_priority(stream_id, urgency, incremental).ok();
+					}
                     match self.h3_conn.send_response_with_priority(
                         conn, stream_id, &headers, &priority, false,
                     ) {
@@ -1501,15 +1540,18 @@ impl HttpConn for Http3Conn {
                         },
                     }
 
-                    let response = PartialResponse {
-                        headers: None,
-                        priority: None,
-                        body,
-                        written: 0,
-                    };
+					let response = PartialResponse {
+						headers: None,
+						priority: Some(priority), // store it!
+						body,
+						written: 0,
+					};
 
                     partial_responses.insert(stream_id, response);
                 },
+
+
+		
 
                 Ok((stream_id, quiche::h3::Event::Data)) => {
                     info!(
@@ -1555,11 +1597,33 @@ impl HttpConn for Http3Conn {
                 },
             }
         }
+		
+		
+		for (id, resp) in partial_responses.iter() {
+			info!("Pending stream {} at priority {:?}", id, resp.priority);
+		}
 
         // Visit all writable response streams to send HTTP content.
-        for stream_id in writable_response_streams(conn) {
-            self.handle_writable(conn, partial_responses, stream_id);
-        }
+		let mut grouped: HashMap<(u8, bool), Vec<u64>> = HashMap::new();
+		for sid in writable_response_streams(conn) {
+			let prio = partial_responses.get(&sid)
+				.and_then(|r| r.priority.clone())
+				.unwrap_or_else(|| Priority::new(3, false)); // default
+
+			grouped.entry((prio.urgency(), prio.incremental()))
+				   .or_default()
+				   .push(sid);
+		}
+				
+		for ((urgency, incremental), mut streams) in grouped {
+			if !incremental {
+				streams.sort(); // order by stream ID
+			}
+
+			for sid in streams {
+				self.handle_writable(conn, partial_responses, sid);
+			}
+		}
 
         // Process datagram-related events.
         while let Ok(len) = conn.dgram_recv(buf) {
@@ -1596,63 +1660,93 @@ impl HttpConn for Http3Conn {
 
         Ok(())
     }
+	
 
-    fn handle_writable(
-        &mut self, conn: &mut quiche::Connection,
-        partial_responses: &mut HashMap<u64, PartialResponse>, stream_id: u64,
-    ) {
-        debug!(
-            "{} response stream {} is writable with capacity {:?}",
-            conn.trace_id(),
-            stream_id,
-            conn.stream_capacity(stream_id)
-        );
+   fn handle_writable(
+    &mut self,
+    conn: &mut quiche::Connection,
+    partial_responses: &mut HashMap<u64, PartialResponse>,
+    stream_id: u64,
+) {
+    debug!(
+        "{} response stream {} is writable with capacity {:?}",
+        conn.trace_id(),
+        stream_id,
+        conn.stream_capacity(stream_id)
+    );
+	
+	  // Extract priority early, before mutable borrow
+    let this_prio = partial_responses
+        .get(&stream_id)
+        .and_then(|resp| resp.priority.clone())
+        .unwrap_or_else(|| Priority::new(3, false));
 
-        if !partial_responses.contains_key(&stream_id) {
-            return;
+    // Now safe: we’re no longer mutably borrowing here
+    let skip = partial_responses.iter().any(|(other_id, other_resp)| {
+        *other_id != stream_id &&
+        other_resp.priority.is_some() &&
+        {
+            let p = other_resp.priority.as_ref().unwrap();
+            p.urgency() < this_prio.urgency() || (
+                p.urgency() == this_prio.urgency() && !p.incremental() && this_prio.incremental()
+            )
         }
+    });
 
-        let resp = partial_responses.get_mut(&stream_id).unwrap();
+    if skip {
+        return;
+    }
 
-        if let (Some(headers), Some(priority)) = (&resp.headers, &resp.priority) {
-            match self.h3_conn.send_response_with_priority(
-                conn, stream_id, headers, priority, false,
-            ) {
-                Ok(_) => (),
+    // Now we mutably borrow safely
+    let Some(resp) = partial_responses.get_mut(&stream_id) else { return };
 
-                Err(quiche::h3::Error::StreamBlocked) => {
-                    return;
-                },
-
-                Err(e) => {
-                    error!("{} stream send failed {:?}", conn.trace_id(), e);
-                    return;
-                },
+    /* ── 1.  flush HEADERS if they were blocked ───────────────────────── */
+    if let (Some(headers), Some(priority)) = (&resp.headers, &resp.priority) {
+        match self
+            .h3_conn
+            .send_response_with_priority(conn, stream_id, headers, priority, false)
+        {
+            Ok(_) => {
+                resp.headers  = None;
+                /* keep the priority value: we still need it for sorting */
+            }
+            Err(quiche::h3::Error::StreamBlocked) => return, // still blocked
+            Err(e) => {
+                error!("{} stream send failed {:?}", conn.trace_id(), e);
+                partial_responses.remove(&stream_id);
+                return;
             }
         }
+    }
 
-        resp.headers = None;
-        resp.priority = None;
+    /* ── 2.  decide how much BODY we can write now ────────────────────── */
+    let credit   = conn.stream_capacity(stream_id).unwrap_or(0) as usize;
+    let window   = credit.min(BURST);
 
-        let body = &resp.body[resp.written..];
+    let left     = resp.body.len() - resp.written;
+    let chunk    = left.min(window);
+    if chunk == 0 {
+        return;                     // no flow-control credit this round
+    }
 
-        let written = match self.h3_conn.send_body(conn, stream_id, body, true) {
-            Ok(v) => v,
+    let fin      = resp.written + chunk == resp.body.len();
+    let slice    = &resp.body[resp.written .. resp.written + chunk];
 
-            Err(quiche::h3::Error::Done) => 0,
-
-            Err(e) => {
-                partial_responses.remove(&stream_id);
-
-                error!("{} stream send failed {:?}", conn.trace_id(), e);
-                return;
-            },
-        };
-
-        resp.written += written;
-
-        if resp.written == resp.body.len() {
+    /* ── 3.  write that slice ─────────────────────────────────────────── */
+    match self.h3_conn.send_body(conn, stream_id, slice, fin) {
+        Ok(n)  => resp.written += n,
+        Err(quiche::h3::Error::Done) => return,  // still blocked
+        Err(e) => {
+            error!("{} stream send failed {:?}", conn.trace_id(), e);
             partial_responses.remove(&stream_id);
+            return;
         }
     }
+
+    /* ── 4.  finished? drop bookkeeping ───────────────────────────────── */
+    if resp.written == resp.body.len() {
+        partial_responses.remove(&stream_id);
+    }
+}
+
 }

@@ -1,0 +1,4 @@
+@echo off
+:: This is a fallback/old way to launch a test chrome.exe
+:: You will have to change the path below to use this, please use 'launch-chrome.ps1' for automatic path detection.
+"C:\Users\remis\AppData\Local\Google\Chrome SxS\Application\chrome.exe" --origin-to-force-quic-on=localhost:4433 --host-resolver-rules="MAP localhost:4433 127.0.0.1:4433" --ignore-certificate-errors --ignore-certificate-errors-spki-list=MCFtYhgL/+T4kkcV64TQTTAw0Q5Gq2360530xEr9lFs= --ignore-urlfetcher-cert-requests --disable-proxy-certificate-handler --disable-test-root-certs --disable-content-security-policy --disable-web-security --allow-insecure-localhost --allow-running-insecure-content --disable_certificate_verification --allow_unknown_root_cert https://localhost:4433/test.html
